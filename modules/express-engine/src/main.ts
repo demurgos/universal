@@ -12,6 +12,7 @@ import { REQUEST, RESPONSE } from './tokens';
  * These are the allowed options for the engine
  */
 export interface NgSetupOptions {
+  cacheKey?: string | Symbol;
   bootstrap: Type<{}> | NgModuleFactory<{}>;
   compilerProviders?: StaticProvider[];
   providers?: StaticProvider[];
@@ -30,10 +31,12 @@ export interface RenderOptions extends NgSetupOptions {
  */
 const templateCache: { [key: string]: string } = {};
 
+type CacheKey = string | Symbol | Type<{}>;
+
 /**
  * Map of Module Factories
  */
-const factoryCacheMap = new Map<Type<{}>, NgModuleFactory<{}>>();
+const factoryCacheMap = new Map<CacheKey, NgModuleFactory<{}>>();
 
 /**
  * This is an express engine for handling Angular Applications
@@ -42,17 +45,18 @@ export function ngExpressEngine(setupOptions: NgSetupOptions) {
 
   const compilerFactory: CompilerFactory = platformDynamicServer().injector.get(CompilerFactory);
 
-  let compilerProviders: StaticProvider[] = [
+  let setupCompilerProviders: StaticProvider[] = [
     { provide: ResourceLoader, useClass: FileLoader, deps: [] },
   ];
 
   if (setupOptions.compilerProviders) {
-    compilerProviders.push(...setupOptions.compilerProviders);
+    setupCompilerProviders.push(...setupOptions.compilerProviders);
   }
 
-  const compiler: Compiler = compilerFactory.createCompiler([
+  // Compiler using the providers from `setupOptions`
+  const setupCompiler: Compiler = compilerFactory.createCompiler([
     {
-      providers: compilerProviders
+      providers: setupCompilerProviders
     }
   ]);
 
@@ -82,7 +86,20 @@ export function ngExpressEngine(setupOptions: NgSetupOptions) {
           }
         ]);
 
-      getFactory(moduleOrFactory, compiler)
+      // Compile the module only once per distinct cacheKey value
+      const cacheKey: CacheKey = options.cacheKey || setupOptions.cacheKey || moduleOrFactory;
+
+      // If the options define some extra compiler providers, create (lazily) a new compiler using them
+      let compilerProvider: () => Compiler;
+      if (options.compilerProviders) {
+        compilerProvider = () => compilerFactory.createCompiler([{
+          providers: setupCompilerProviders.concat(options.compilerProviders)
+        }]);
+      } else {
+        compilerProvider = () => setupCompiler;
+      }
+
+      getFactory(moduleOrFactory, compilerProvider, cacheKey)
         .then(factory => {
           return renderModuleFactory(factory, {
             extraProviders: extraProviders
@@ -101,9 +118,16 @@ export function ngExpressEngine(setupOptions: NgSetupOptions) {
 
 /**
  * Get a factory from a bootstrapped module/ module factory
+ *
+ * @param moduleOrFactory The module to compile (or already compiled factory)
+ * @param compilerProvider A function returning the compiler to use if the cache is invalid
+ * @param cacheKey The cache key, at most one module will be compiled for each distinct value of `cacheKey`
+ * @return The compiled factory
  */
 function getFactory(
-  moduleOrFactory: Type<{}> | NgModuleFactory<{}>, compiler: Compiler
+  moduleOrFactory: Type<{}> | NgModuleFactory<{}>,
+  compilerProvider: () => Compiler,
+  cacheKey: CacheKey,
 ): Promise<NgModuleFactory<{}>> {
   return new Promise<NgModuleFactory<{}>>((resolve, reject) => {
     // If module has been compiled AoT
@@ -111,7 +135,7 @@ function getFactory(
       resolve(moduleOrFactory);
       return;
     } else {
-      let moduleFactory = factoryCacheMap.get(moduleOrFactory);
+      let moduleFactory = factoryCacheMap.get(cacheKey);
 
       // If module factory is cached
       if (moduleFactory) {
@@ -120,9 +144,9 @@ function getFactory(
       }
 
       // Compile the module and cache it
-      compiler.compileModuleAsync(moduleOrFactory)
+      compilerProvider().compileModuleAsync(moduleOrFactory)
         .then((factory) => {
-          factoryCacheMap.set(moduleOrFactory, factory);
+          factoryCacheMap.set(cacheKey, factory);
           resolve(factory);
         }, (err => {
           reject(err);
